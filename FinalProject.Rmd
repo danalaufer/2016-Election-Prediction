@@ -1,0 +1,1092 @@
+---
+title: "2016 Election Analysis"
+author: "Dana Laufer"
+date: "12/14/2020"
+output: pdf_document
+---
+
+```{r setup, echo = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+library(tidyverse)
+library(ggplot2)
+library(maps)
+library(ROCR)
+library(tree)
+library(maptree)
+library(class)
+library(lattice)
+library(ggridges)
+library(randomForest)
+library(superheat)
+library(dendextend)
+library(glmnet)
+library(tinytex)
+library(ISLR)
+library(class)
+library(rpart)
+library(gbm)
+```
+
+
+```{r}
+setwd('~/F20/PSTAT131')
+
+# Read data and convert candidate from string to factor
+election.raw <- read.delim("data/election/election.csv", sep = ",") %>% 
+  mutate(candidate=as.factor(candidate))
+
+census_meta <- read.delim("data/census/metadata.csv", sep = ";", header = FALSE) 
+census <- read.delim("data/census/census.csv", sep = ",") 
+```
+
+1. Filter out FIPS values of 2000.
+
+```{r}
+# Filter out FIPS of 2000
+election.raw <- election.raw %>% 
+  filter(fips != 2000)
+
+# Retrieve the dimensions
+dim(election.raw)
+```
+
+4. The new election.raw dataframe, not including rows with a FIPS value of 2000, has 18,345 rows and 4 columns.  
+
+5. I will filter all federal-level election data into election_federal by taking out all rows with a FIPS value of US. Then, I will filter all state-level data into election_state by filtering all rows with a county name of NA. 
+
+```{r}
+# Filter federal election data into its own dataframe
+election_federal <- election.raw %>% 
+  filter(fips == 'US')
+
+# Filter out federal election data from election.raw
+election.raw <- election.raw %>% 
+  filter(fips != 'US')
+  
+# Filter state data into its own dataframe
+election_state <- election.raw %>% 
+  filter(is.na(county))
+
+# Filter out state data from election.raw
+election.raw <- election.raw %>% 
+  filter(!is.na(county))
+```
+
+6. There were 31 named presidential candidates in the 2016 election. A bar chart of all votes recieved by each candidate is given below, plotted on a logarithmic scale. 
+
+```{r}
+# Filter out the unnamed candidate votes
+candidate.info <- election_federal %>% 
+  filter(candidate != ' None of these candidates')
+
+# Find how many named candidates there were
+dim(candidate.info)
+```
+
+```{r,  fig.width = 30, fig.height = 25}
+# Plot a barchart of total votes per candidate, in decreasing order
+ggplot(candidate.info, aes(x = reorder(candidate, -votes), y = votes)) + 
+  geom_col(fill = 'purple') + 
+  theme(axis.text.x = element_text(angle = -45, hjust = 0), text = element_text(size = 30), 
+        plot.title = element_text(hjust = 0.5),  plot.margin = unit(c(2.5, 2.5, 2.5, 2.5), 'cm')) +
+  scale_y_log10() +
+  ggtitle('Logarithmic Votes per Candidate') +
+  xlab('Candidate') +
+  ylab('Total Votes')
+```
+
+7. Here I create dataframes that list each county or state exactly once, along with the candidate with the highest proportion of votes. In addition, the total votes, votes for winning candidate, and proportion of votes for winning candidate are given for each row.
+
+```{r}
+# Find candidate with highest proportion of votes per county
+county_winner <- election.raw %>% 
+  group_by(fips) %>% 
+  mutate(total = sum(votes)) %>% 
+  mutate(pct = votes/total) %>% 
+  top_n(1, pct)
+
+# Find candidate with highest proportion of votes per state
+state_winner <- election_state %>% 
+  group_by(fips) %>% 
+  mutate(total = sum(votes)) %>% 
+  mutate(pct = votes/total) %>% 
+  top_n(1, pct)
+```
+
+8. Here I draw a county level map, colored by county.
+
+```{r}
+counties <- map_data("county")
+states <- map_data('state')
+
+ggplot(data = counties) + 
+  geom_polygon(aes(x = long, y = lat, fill = subregion, group = group), color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE) + 
+  theme_void() 
+```
+
+9. Now I'll map each state and color it by the winning candidate, where a red state corresponds to a majority vote for Trump and blue corresponds to Clinton.
+
+```{r}
+states <- states %>% 
+  mutate(fips = state.abb[match(region, tolower(state.name))])
+
+# Combine state mapping info and state winner
+combined_states <- left_join(states, state_winner, by = 'fips')
+
+# plot the state map 
+ggplot(data = combined_states) + 
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group), color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE) +
+  scale_fill_manual(values = c('red3', 'dodgerblue3')) +
+  theme_void()
+```
+
+10. Here I map each county color it by the winning candidate, where again, red corresponds to a majority vote for Trump and blue corresponds to Clinton.
+
+```{r}
+# Get county FIPs and isolated county names
+county_fips <- maps::county.fips %>% 
+  separate(col = polyname, into = c('region', 'subregion'), sep = ',') %>% 
+  mutate(fips = as.factor(fips))
+
+# Combine county mapping info and county names
+counties <- left_join(counties, county_fips, by = c('region', 'subregion'))
+
+# Combine county mapping info and county winners
+combined_counties <- left_join(county_winner, counties, by = 'fips') 
+
+# Plot the map
+ggplot(data = combined_counties) + 
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group), color = "white", size = 0.25) + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE) +
+  scale_fill_manual(values = c('red3', 'dodgerblue3')) +
+  theme_void()
+```
+
+11. I created a scatterplot matrix, comparing several attributes of a small sample of the census data. (The entire dataset has far too many points to be able to make anything out of the plots).
+
+```{r}
+set.seed(2)
+
+# Take sample of census data
+idx <- sample(nrow(census), 0.001*nrow(census))
+pairs(census[idx, c('Men', 'White', 'IncomePerCap', 'Professional', 'Office', 'MeanCommute', 'Construction', 'Production')],
+      main = "Scatterplot Matrix")
+```
+
+12. Here, I'll aggregate the census data into county level data. 
+
+```{r, warning = FALSE}
+# Filter out NA values, convert to percentages and compute Minority
+census.del <- census %>% 
+  drop_na() %>% 
+  mutate_at(vars(c('Men', 'Employed', 'Citizen', 'Women')), funs(./TotalPop*100)) %>% 
+  mutate(Minority = Hispanic + Black + Native + Asian + Pacific) %>% 
+  select(c(-Walk, -PublicWork, -Construction, -Hispanic, -Black, -Native, -Asian, -Pacific))
+
+# Aggregate and compute weight of each subcounty
+census.subct <- census.del %>% 
+  group_by(State, County) %>% 
+  mutate(CountyTotal = sum(TotalPop)) %>% 
+  mutate(Weight = TotalPop/CountyTotal)
+
+# Aggregate into county level data by taking weighted sum
+census.ct <- census.subct %>% 
+  summarise_at(vars(c(-'Weight', -'TotalPop', -'CountyTotal')), funs(Weight*.)) %>% 
+  group_by(State, County) %>% 
+  summarise_all(sum)
+
+head(census.ct)
+```
+
+11. (b) Here, I create another small visualization based on the census data, this time using the county level data just computed to aid. First, I joined the county level censu sdata with the county level election data. Then, for numerous attributes of choice, I created a new dataframe with just the counties whose value of that attribute was greater than the 75th percentile of all country wide data. So, for example, I created a dataframe with just counties whose percentage of white population was greater than the 75th percentile of all county's white population percentage. Then for each dataframe, I calculated the proportion of votes that each candidate got among all counties in the dataframe. Finally, I created a barplot, where each of my dataframes had two bars: one with the proportion of votes for Clinton, and one with proportion of votes for Trump. This created the following visualization. 
+
+```{r}
+# Take County off the end of the county names
+election.raw <- election.raw %>% 
+  separate(col = county, into = c('County', 'Blank'), sep = -7) %>% 
+  select(-Blank) %>% 
+  mutate(State = state.name[match(state, state.abb)])    # Convert to state names
+
+# Join census and election data
+census_voting_data <- left_join(election.raw, census.ct, by = c('State', 'County')) %>% 
+  mutate(candidate = as.character(candidate))
+```
+
+```{r}
+# Counties with high rates of professional workers
+prof.maj <- census_voting_data %>% 
+  filter(Professional > quantile(census.subct$'Professional', 0.75)) %>% 
+  group_by(candidate) %>% 
+  summarise_at('votes', sum) %>% 
+  mutate(voteprop = votes/sum(votes), Type = 'Professional Workers')
+
+# Counties with high rates of men
+men.maj <- census_voting_data %>% 
+  filter(Men > quantile(census.subct$'Men', 0.75)) %>% 
+  group_by(candidate) %>% 
+  summarise_at('votes', sum) %>% 
+  mutate(voteprop = votes/sum(votes), Type = 'Men')
+
+# Counties with high rates of women
+women.maj <- census_voting_data %>% 
+  filter(Women > quantile(census.subct$'Women', 0.75)) %>% 
+  group_by(candidate) %>% 
+  summarise_at('votes', sum) %>% 
+  mutate(voteprop = votes/sum(votes), Type = 'Women')
+
+# Counties with high rates of minorities
+minority.maj <- census_voting_data %>% 
+  filter(Minority > quantile(census.subct$'Minority', 0.75)) %>% 
+  group_by(candidate) %>% 
+  summarise_at('votes', sum) %>% 
+  mutate(voteprop = votes/sum(votes), Type = 'Minorities')
+
+# Counties with high rates of white people
+white.maj <- census_voting_data %>% 
+  filter(White > quantile(census.subct$'White', 0.75)) %>% 
+  group_by(candidate) %>% 
+  summarise_at('votes', sum) %>% 
+  mutate(voteprop = votes/sum(votes), Type = 'White People')
+
+# Counties with high rates of poverty
+poor.maj <- census_voting_data %>% 
+  filter(Poverty > quantile(census.subct$'Poverty', 0.75)) %>% 
+  group_by(candidate) %>% 
+  summarise_at('votes', sum) %>% 
+  mutate(voteprop = votes/sum(votes), Type = 'Poverty')
+
+# Counties with high rates of production workers
+product.maj <- census_voting_data %>% 
+  filter(Production > quantile(census.subct$'Production', 0.75)) %>% 
+  group_by(candidate) %>% 
+  summarise_at('votes', sum) %>% 
+  mutate(voteprop = votes/sum(votes), Type = 'Production Workers')
+
+# Counties with high rates of lone commuters by vehicle
+drive.maj <- census_voting_data %>% 
+  filter(Drive > quantile(census.subct$'Drive', 0.75)) %>% 
+  group_by(candidate) %>% 
+  summarise_at('votes', sum) %>% 
+  mutate(voteprop = votes/sum(votes), Type = 'Commute in Vehicle')
+
+# Counties with high rates of commuters by public transportation
+transit.maj <- census_voting_data %>% 
+  filter(Transit > quantile(census.subct$'Transit', 0.75)) %>% 
+  group_by(candidate) %>% 
+  summarise_at('votes', sum) %>% 
+  mutate(voteprop = votes/sum(votes), Type = 'Commute on Transit')
+```
+
+```{r}
+# Combine all of the dataframes found above
+census.data <- rbind(women.maj, men.maj, white.maj, poor.maj, drive.maj,
+                     minority.maj, product.maj, prof.maj, transit.maj) %>% 
+  filter(candidate %in% c("Donald Trump", "Hillary Clinton")) %>% 
+  mutate(voteprop = as.double(voteprop))
+``` 
+
+
+```{r}
+ggplot(census.data %>% arrange(voteprop) %>%
+    mutate(Type = factor(Type, levels = Type[candidate == "Donald Trump"])), 
+    aes(fill=candidate, y = voteprop, x = Type)) + 
+  geom_bar(position="dodge", stat="identity", width = 0.5) +
+  scale_fill_manual(values = c('red3', 'dodgerblue3', 'purple')) +
+  theme(axis.text.x = element_text(angle = -35, hjust = 0), text = element_text(size = 10), 
+        plot.title = element_text(hjust = 0.5)) + 
+  xlab('Demographic in Question') +
+  ylab('Voting Distribution') +
+  labs(fill = 'Candidate') +
+  ggtitle('Voting Distribution of Counties with High Rates of:')
+```
+
+Now I'll filter out any unnecessary columns. I filter out the colums Women and Minority, since both of these are just the counterpart to Men and White respectively. 
+
+```{r}
+census.ct <- census.ct %>% 
+  select(-c(Women, Minority))
+
+census.subct <- census.subct %>% 
+  select(-c(Women, Minority))
+```
+
+13. Now I'll run PCA on the data.
+
+```{r, include = FALSE}
+# Run PCA on county and subcounty data
+census.ct.pca <- prcomp(census.ct[,c(-1,-2)], scale = TRUE, center = TRUE)
+census.subct.pca <- prcomp(census.subct[c(-1, -2)], scale = TRUE, center = TRUE)
+
+# Save first two PCs
+ct.pc <- census.ct.pca$rotation[, 1:2]
+subct.pc <- census.subct.pca$rotation[, 1:2]
+
+# Sort the absolute values of PCs to find the largest ones
+sort(abs(census.ct.pca$rotation[,1]), decreasing = TRUE, index.return = TRUE)$x
+census.ct.pca$rotation[,1]
+```
+
+IncomePerCap, ChildPoverty and Poverty are the three features with the largest absolute values of first principal component on the county level. IncomePerCap is positive, while ChildPoverty and Poverty are negative. . 
+
+```{r}
+# Sort absolute values of PCs to find largest ones
+sort(abs(census.subct.pca$rotation[,1]), decreasing = TRUE, index.return = TRUE)$x
+census.subct.pca$rotation[,1]
+```
+
+IncomePerCap, Professional and Income are the three features with the biggest absolute values of first principal component on sub county level. Here, all three of these attributes have positive PC1 values. 
+
+14. Here I determine that the minimum number of principal components needed to capture 90% of the county data is 18, while for sub county data it is 21. 
+
+```{r, include = FALSE}
+# Calculate PVE and CPVE
+ct.PVE <- census.ct.pca$sdev/sum(census.ct.pca$sdev)
+ct.CPVE <- cumsum(ct.PVE)
+
+# How many PC's needed to explain 90% of variation?
+min(which(ct.CPVE > 0.9))
+```
+
+```{r}
+# Plot PVE 
+plot(ct.PVE, type = 'l', ylab = "Proportion of Variance Explained", xlab = "Principal Component #", main = "Proportion of County Variance Explained", col = 'orange')
+
+# Plot CPVE and illustrate point at which 90% variance explained
+plot(ct.CPVE, type = 'l', ylab = "Cumulative Proportion of Variance Explained", xlab = "Principal Component #", 
+     main = "Cumulative Proportion of County Variance Explained", col = 'blue')
+abline(h = 0.9, v = 18, lty = 3, col = 'red')
+```
+
+```{r}
+# Calculate PVE and CPVE
+subct.PVE <- census.subct.pca$sdev/sum(census.subct.pca$sdev)
+subct.CPVE <- cumsum(subct.PVE)
+
+# How many PC's needed to explain 90% of variation?
+min(which(subct.CPVE > 0.9))
+```
+
+```{r}
+# Plot PVE 
+plot(subct.PVE, type = 'l', ylab = "Proportion of Variance Explained", xlab = "Principal Component #", main = "Proportion of Sub-County Variance Explained", col = 'orange')
+
+# Plot CPVE and illustrate point at which 90% variation is explained
+plot(subct.CPVE, type = 'l', ylab = "Cumulative Proportion of Variance Explained", xlab = "Principal Component #", 
+     main = "Cumulative Proportion of Sub-County Variance Explained", col = 'blue')
+abline(h = 0.9, v = 21, lty = 3, col = 'red')
+```
+
+We need 21 PCs to explain 90% of the subcounty data. 
+
+15. Now I perform hierarchical clustering with complete linkage on the county level census data. 
+
+```{r, fig.width = 70, fig.height = 75, fig.align = 'center'}
+# Find distance matrix
+ct.dist <- dist(census.ct[, c(-1,-1)], method = 'euclidean')
+# Run hierarchical clustering using complete linkage
+ct.hc <- hclust(ct.dist, method = 'complete')
+
+# Construct a dendogram with 10 clusters
+dend.ct = as.dendrogram(ct.hc)
+dend.ct = color_branches(dend.ct, k = 10)
+dend.ct = color_labels(dend.ct, k=10)
+# Change label size
+dend.ct = set(dend.ct, "labels_cex", 1)
+
+# Plot the dendrogram
+plot(dend.ct, horiz=T)
+title("Dendrogram on County Level Census Data", cex = 100)
+
+class(dend.ct)
+```
+
+```{r}
+cut.ct.hc <- cutree(ct.hc, k = 10)
+cut.ct.hc[which(census.ct$County == "San Mateo")]
+census.ct[which(cut.ct.hc == 9), ]
+```
+
+By investigating the dendogram cut at 10 clusters, I see that San Mateo County is in cluster 9, along with 26 other couties from many different states.
+
+Now I run hierarchical clustering again, this time on the first five principal components. 
+
+```{r, fig.height = 75, fig.width = 70, fig.align = 'center'}
+# Find distance matrix
+ct.pc.dist <- dist(census.ct.pca$x[, 1:5], method = 'euclidean')
+# Run hierarchical clustering using complete linkage
+ct.pc.hc <- hclust(ct.pc.dist, method = 'complete')
+
+# Construct a dendogram with 10 clusters
+dend.pc.ct = as.dendrogram(ct.pc.hc)
+dend.pc.ct = color_branches(dend.pc.ct, k=10)
+dend.pc.ct = color_labels(dend.pc.ct, k=10)
+# Change label size
+dend.pc.ct = set(dend.pc.ct, "labels_cex" = 2)
+
+# Plot the dendrogram
+plot(dend.pc.ct, horiz=T, main = "Dendrogram On Principal Components", cex = 5)
+```
+
+```{r, include = FALSE}
+cut.ct.pc.hc <- cutree(ct.pc.hc, k = 10)
+cut.ct.pc.hc[which(census.ct$County == "San Mateo")]
+census.ct[which(cut.ct.pc.hc == 4), ]
+```
+
+By investigating the new cut dendogram, I see that now San Mateo County is in cluster 4, along with 225 other counties. This time, many of the counties in the cluster are also in California, whereas before, only one was in California. However, this time San Mateo County is in a cluster with many other counties in historically Republican states, such as Utah, Texas and Wyoming. It makes sense that the clusters observed from hierarchical clustering on the first five principal components would be larger and less accurate than that from the full dataset. While the first five components account for much of the variation, it doesn't account for all of it in the same way that the full dataset does. 
+
+Now I'll combine the election and census data.
+
+```{r}
+tmpwinner <- county_winner %>% ungroup %>%
+  mutate(state = state.name[match(state, state.abb)]) %>%               ## state abbreviations
+  mutate_at(vars(state, county), tolower) %>%                           ## to all lowercase
+  mutate(county = gsub(" county| columbia| city| parish", "", county))  ## remove suffixes
+tmpcensus <- census.ct %>% mutate_at(vars(State, County), tolower)
+
+election.cl <- tmpwinner %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+
+## save meta information
+election.meta <- election.cl %>% select(c(county, fips, state, votes, pct, total))
+
+## save predictors and class labels
+election.cl = election.cl %>% select(-c(county, fips, state, votes, pct, total))
+```
+
+```{r}
+set.seed(10) 
+n <- nrow(election.cl)
+in.trn <- sample.int(n, 0.8*n) 
+trn.cl <- election.cl[ in.trn,]
+tst.cl <- election.cl[-in.trn,]
+
+# Transform data so that candidate only has two levels
+trn.cl$candidate <- as.factor(as.character(trn.cl$candidate))
+tst.cl$candidate <- as.factor(as.character(tst.cl$candidate))
+```
+
+```{r}
+set.seed(20) 
+nfold <- 10
+folds <- sample(cut(1:nrow(trn.cl), breaks=nfold, labels=FALSE))
+
+calc_error_rate = function(predicted.value, true.value){
+  return(mean(true.value!=predicted.value))
+}
+
+records = matrix(NA, nrow=6, ncol=2)
+colnames(records) = c("train.error","test.error")
+rownames(records) = c("tree","logistic","lasso", "knn", 'boost', "randomforest")
+```
+
+16. Here, I'll train a decision tree using the training data and prune it to minimize misclassification error.
+
+```{r, fig.width = 70, fig.height = 75, fig.align = 'center'}
+# Construct decision tree
+ct.tree <- tree(candidate ~ .-candidate, data = trn.cl, 
+                 control = tree.control(nobs = nrow(trn.cl),
+                                        minsize = 5, mindev = 1e-5))
+summary(ct.tree)   
+
+draw.tree(ct.tree, nodeinfo = TRUE, cex = 2)
+```
+
+
+```{r}
+set.seed(1)
+
+# Perform 10-Fold CV on decision tree
+cv <- cv.tree(ct.tree, FUN = prune.misclass, K=nfold, rand = folds)
+
+# Find the smallest size that has the minimum misclassification error
+best.size.cv <- min(cv$size[cv$dev == min(cv$dev)])
+```
+ 
+```{r, fig.height = 8}
+# Prune original tree to the optimal size
+ct.tree.pruned <- prune.tree(ct.tree, best = best.size.cv, method = 'misclass')
+
+draw.tree(ct.tree.pruned, nodeinfo = TRUE, cex = 0.75)
+```
+
+Now I record the testing and training error. 
+
+```{r}
+# Predict training values
+pred_train_tree <- predict(ct.tree.pruned, trn.cl, type = 'class')
+
+# Predict test values
+pred_test_tree <-  predict(ct.tree.pruned, tst.cl, type = 'class')
+
+# Record train and testing error
+records['tree', 'test.error'] <- calc_error_rate(pred_test_tree, tst.cl$candidate)
+records['tree', 'train.error'] <- calc_error_rate(pred_train_tree, trn.cl$candidate)
+```
+
+17. Now I run a logistic regression to predict the winning candidate in each county, using 0.5 as the probability threshold. 
+
+```{r, include = FALSE}
+# Fit the logistic regression to training data
+glm.fit <- glm(candidate ~ ., data = trn.cl, family = binomial)
+
+# Predict test data to predict probabilities and round to 5 decimals
+pred_prob_test <- round(predict(glm.fit, tst.cl, type = 'response'), digits = 5)
+# Use 0.5 cutoff to find predicted class
+predicted_ct.test <- ifelse(pred_prob_test <= 0.3, "Donald Trump", "Hillary Clinton")
+
+# Predict training data to predict probabilities and round to 5 decimals
+pred_prob_train <- round(predict(glm.fit, trn.cl, type = 'response'), digits = 5)
+# Use 0.5 cutoff to find predicted class
+predicted_ct  <- ifelse(pred_prob_train <= 0.3, "Donald Trump", "Hillary Clinton")
+
+# Calculate test and training error
+records['logistic', 'test.error'] <- calc_error_rate(predicted_ct.test, tst.cl$candidate)
+records['logistic', 'train.error'] <- calc_error_rate(predicted_ct, trn.cl$candidate)
+
+summary(glm.fit)
+```
+
+There are many significant variables in the logistic regression model, but a few of them are White, Unemployment, Drive, IncomePerCap, and Citizen. Two of these are consistent with the decision tree, but one of the important predictors in the decision tree, Transit, is not significant in this model. It's possible that in this model, since Drive and Carpool are both significant predictors, they take on the same role that Transit did in the decision model, since Transit is almost surely negatively correlated with Drive and Carpool. 
+
+Remember that in a logistic regression, the odds, \begin{math} \dfrac{p}{1-p} \end{math}, are equal to e to the linear combination of predictors and coefficients given. So, a single unit increase in any of the predictors will increase the odds multiplicatively by \begin{math}e^{\beta}\end{math}, where \begin{math} beta \end{math} is the coefficient of the predictor. So, for example, if a county has a one unit increase in percent of white population, the estimated odds that that county will vote for Clinton increase multiplicatively by \begin{math}e^{-1.388e-01}\end{math} = 0.87. Since this number is less than 1, the odds will decrease. In addition, a one unit increase in percent of population that is unemployed will multiplicatively increase the estimated odds that that county will vote for Clinton by \begin{math}e^{2.105e-01}\end{math} = 1.234. Since this number is greater than one, the estimated odds will increase. These two estimations both make sense given the decision tree.
+
+18. Now I'll run K-fold cross validation and select the best regularization parameter for the logistic regression with LASSO penalty.
+
+```{r, warnings = FALSE, include = FALSE}
+# Fit the logistic regression to spam.train
+glm.lassofit <- cv.glmnet(as.matrix(trn.cl[, -1]), as.character(trn.cl$candidate), family = 'binomial',
+                          type.measure = 'class',alpha = 1,  lambda = c(1, 5, 10, 50) * 1e-4, nfolds = nfold)
+
+glm.lassofit$cvm
+coef(glm.lassofit, s = 50e-4)
+
+# Predict spam.test probabilities and round to 5 decimals
+pred_prob_lassotest <- round(predict(glm.lassofit, as.matrix(tst.cl[, -1]), s = 50e-4, type = 'response'), digits = 5)
+# Use 0.5 cutoff to find predicted class
+predicted_ct.lassotest <- ifelse(pred_prob_lassotest <= 0.5, "Donald Trump", "Hillary Clinton")
+
+# Predict spam.train probabilities and round to 5 decimals
+pred_prob_train <- round(predict(glm.lassofit, as.matrix(trn.cl[, -1]), s = 50e-4, type = 'response'), digits = 5)
+# Use 0.5 cutoff to find predicted class
+predicted_lasso_ct  <- ifelse(pred_prob_train <= 0.5, "Donald Trump", "Hillary Clinton")
+
+# Calculate test and training error
+records['lasso', 'test.error'] <- calc_error_rate(predicted_ct.lassotest, tst.cl$candidate)
+records['lasso', 'train.error'] <- calc_error_rate(predicted_lasso_ct, trn.cl$candidate)
+```
+
+The MSE is minimized when the regularization parameter lambda is set to 50e-4. When fitting the regression with this optimal value of lambda, all of the coefficients are non-zero except for  Income, IncomeErr, Office, Trasit and WorkAtHome. So, most of the important predictors from the last two classification models are still significant in this model. However, Income was one of the significant predictors in the logistic regression, and is now zero. This simplification of the model most likely led to a great decrease in variation, and therefore increased the bias slightly. 
+Before moving, I'd also like to fit three more classification models: a KNN model, boosting model and random forest. First I'll do the KNN model using cross validation.
+
+```{r, include = FALSE}
+do.chunk <- function(chunkid, folddef, Xdat, Ydat, k){
+  
+  train = (folddef!=chunkid)
+  
+  Xtr = Xdat[train,]
+  Ytr = Ydat[train]
+  
+  Xvl = Xdat[!train,]
+  Yvl = Ydat[!train]
+  
+  ## get classifications for current training chunks
+  predYtr = knn(train = Xtr, test = Xtr, cl = Ytr, k = k)
+  
+  ## get classifications for current test chunk
+  predYvl = knn(train = Xtr, test = Xvl, cl = Ytr, k = k)
+  
+  data.frame(train.error = calc_error_rate(predYtr, Ytr),
+    val.error = calc_error_rate(predYvl, Yvl))
+}
+```
+
+```{r}
+set.seed(1)
+library(plyr)
+kvec = c(1, seq(10, 50, length.out=5))
+train.error.mean = c()
+test.error.mean = c()
+
+for (j in kvec){
+  # Perform 10-fold CV on training set for KNN with each k in kvec 
+  tmp = ldply(1:10, do.chunk, folddef = folds, Xdat = trn.cl[-1], 
+      Ydat = trn.cl$candidate, k = j)
+  
+  # Find mean train and testing error
+  train.error.mean <- c(train.error.mean, mean(tmp$train.error))
+  test.error.mean <- c(test.error.mean, mean(tmp$val.error))
+}
+
+# Record # of neighbors and mean train and testing error
+error.folds <- data.frame(neighbors = kvec, train.error.mean, test.error.mean)
+error.folds
+
+# Find the rows with lowest test error
+lowest.test.error <- error.folds %>% 
+  filter(test.error.mean == min(test.error.mean))
+
+# If there's a tie, return the maximum neighbor 
+best.kfold <- max(lowest.test.error$neighbors)
+best.kfold
+
+```
+So, a k value of 50 leads to the the smallest estimated test error.
+
+```{r}
+# Predict spam.test
+pred_trn_knn <- knn(train = trn.cl[-1], test = trn.cl[-1], 
+               cl = trn.cl$candidate, k = 50)
+
+# Predict spam.train
+pred_tst_knn <- knn(train = trn.cl[-1], test = tst.cl[-1], 
+               cl = trn.cl$candidate, k = 50)
+
+# Record the train and testing error of KNN model
+records['knn', 'test.error'] <- calc_error_rate(pred_tst_knn, tst.cl$candidate)
+records['knn', 'train.error'] <- calc_error_rate(pred_trn_knn, trn.cl$candidate)
+```
+
+Now I'll fit the boosting model, using a shrinkage parameter of 0.01.
+
+```{r}
+set.seed(1)
+# Fit boosting model to training set
+boost.cl <- gbm(ifelse(candidate=="Hillary Clinton",1,0) ~ ., data = trn.cl,
+                     distribution = 'bernoulli', n.trees = 1000,
+                     shrinkage = 0.01)
+
+# Most important predictors
+summary(boost.cl, cBars = 3)
+```
+
+The most important predictors are by far Transit and White. Now I'll record testing and training error.
+
+```{r}
+# Predict using boosting model
+boost_tst.num <- predict(boost.cl, newdata = tst.cl, type = 'response')
+boost_tst <- ifelse(boost_tst.num >= 0.5, 'Hillary Clinton', 'Donald Trump')
+
+# Predict using boosting model
+boost_trn <- predict(boost.cl, newdata = trn.cl, type = 'response')
+boost_trn <- ifelse(boost_trn >= 0.5, 'Hillary Clinton', 'Donald Trump')
+
+records['boost', 'test.error'] <- calc_error_rate(boost_tst, tst.cl$candidate)
+records['boost', 'train.error'] <- calc_error_rate(boost_trn, trn.cl$candidate)
+```
+
+Now I'll fit a random forest model.
+
+```{r}
+set.seed(1)
+
+# Fit random forest model to training set
+rf.cl <- randomForest(candidate ~ ., data = trn.cl, importance = TRUE)
+varImpPlot(rf.cl, n.var = 5, main = "Random Forest Variable Importance")
+```
+
+The most important predictors are once again by far Transit and White. Now I'll record the testing and trainng error.
+
+(d)
+```{r}
+# Predict using boosting model
+rf_tst <- predict(rf.cl, newdata = tst.cl, type = 'response')
+
+# Predict using boosting model
+rf_trn <- predict(rf.cl, newdata = trn.cl, type = 'response')
+
+records['randomforest', 'test.error'] <- calc_error_rate(rf_tst, tst.cl$candidate)
+records['randomforest', 'train.error'] <- calc_error_rate(rf_trn, trn.cl$candidate)
+```
+
+Now I'll plot the ROC curves for each of the six models.
+
+```{r}
+# Find ROC values for lasso regression
+lasso.pred <- prediction(pred_prob_lassotest, as.character(tst.cl$candidate))
+lasso.perf <- performance(lasso.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for logistic regression
+log.pred <- prediction(pred_prob_test, as.character(tst.cl$candidate))
+log.perf <- performance(log.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for decision tree
+tree.pred <- prediction(c(pred_test_tree), as.character(tst.cl$candidate))
+tree.perf <- performance(tree.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for knn
+knn.pred <- prediction(c(pred_tst_knn), as.character(tst.cl$candidate))
+knn.perf <- performance(knn.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for boosting
+boost.pred <- prediction(ifelse(boost_tst == "Hillary Clinton", 1, 0), 
+                         ifelse(tst.cl$candidate=="Hillary Clinton",1,0))
+boost.perf <- performance(boost.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for random forest
+rf.pred <- prediction(c(rf_tst), as.character(tst.cl$candidate))
+rf.perf <- performance(rf.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Plot them both on the same plot in different colors.
+plot(log.perf, col = 'red', lwd = 3, main = 'ROC Curve')
+plot(tree.perf, col = 'blue', lwd = 3, add = TRUE)
+plot(lasso.perf, col = 'green', lwd = 3, add = TRUE)
+plot(knn.perf, col = 'yellow', lwd = 3, add = TRUE)
+plot(boost.perf, col = 'purple', lwd = 3, add = TRUE)
+plot(rf.perf, col = 'black', lwd = 3, add = TRUE)
+legend(0.8, 0.75, legend = c("Log", "Tree", "Lasso", "KNN", "Boost", "Random Forest"),
+       col = c("red", 'blue', 'green', 'yellow', 'purple', 'black'), cex = 0.7, lty = 1)
+abline(0,1)
+
+```
+
+
+```{r}
+(log.auc = performance(log.pred, 'auc')@y.values)
+(tree.auc = performance(tree.pred, 'auc')@y.values)
+(lasso.auc = performance(lasso.pred, 'auc')@y.values)
+(knn.auc = performance(knn.pred, 'auc')@y.values)
+(boost.auc = performance(boost.pred, 'auc')@y.values)
+(rf.auc = performance(rf.pred, 'auc')@y.values)
+
+records
+```
+
+We see that the lasso model ha the greatest area under the curve, but the random forest has the lowest training and testing error.
+
+20. One thing that has always interested me about elections are the people who change parties from one year to the next. What is it that leads them to vote for one candidate over another? In 2012, Obama, a democratic candidate, won the election, but in 2016, Trump, a Republican candidate, won. There must have been many voters, therefore, who voted for Obama in 2012 and voted for Trump in 2016. (Of course there's also the case that people who voted Obama in 2012 simply did not vote in 2016, but I will not consider that case, especially since estimates say that voter turnout was not that different from 2012 to 2016.) Here, I will investigate the county's whose majority voted for Obama in 2012, but voted for Trump in 2016. First, I'll load in and clean the 2012 election data. 
+
+```{r}
+# Read data and convert candidate from string to factor
+election2012.raw <- read.delim("data/election/election2012.csv", sep = ",") %>% 
+  mutate(candidate=as.factor(candidate))
+
+# Find winner of each county
+county_winner2012 <- election2012.raw %>% 
+  group_by(FIPS) %>% 
+  mutate(pct = candidatevotes/totalvotes) %>% 
+  top_n(1, pct) %>% 
+  select(-c(version, office))
+
+# Fix data to make it ready to join with other data
+tmpwinner2012 <- county_winner2012 %>% ungroup %>%              
+  mutate_at(vars(state, county), tolower) %>%                            ## to all lowercase
+  mutate(county = gsub(" county| columbia| city| parish", "", county))   ## remove suffixes
+
+# Join the 2012 county winner data with 2016 county winner data
+# and make a new column that indicates whether a county flipped
+election.2012 <- left_join(tmpwinner2012, tmpwinner, by = c('state', 'county'), suffix = c('.2012', '.2016')) %>% 
+  na.omit %>% 
+  mutate(FIPS = as.factor(FIPS), party.2016 = ifelse(candidate.2016 == "Donald Trump", "republican", "democrat")) %>%
+  mutate(change = ifelse(party == party.2016, "No Change", 
+                         ifelse(party.2016 == "republican", "Flipped to Republican", "Flipped to Democrat")))
+```
+
+```{r}
+# Combine election data with county mapping data
+combined_counties <- left_join(election.2012, counties, by = c('FIPS' = 'fips')) 
+
+ggplot(data = combined_counties) + 
+  geom_polygon(aes(x = long, y = lat, fill = change, group = group), color = "white", size = 0.25) + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE) +
+  scale_fill_manual(values = c('dodgerblue3', 'red3', 'grey')) +
+  theme_void()
+```
+
+Here, I plotted out the counties and colored them according to whether they flipped in 2016. If a county voted Republican in 2012 but Democratic in 2016, it is colored blue, whereas if a county voted Democratic in 2012 but flipped to Republican in 2016, it is colored in red. As you can see, many of the counties flipped to Republican in 2016.
+
+```{r}
+# Join election data with census data
+election.2012 <- election.2012 %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+
+## save meta information
+election.2012.meta <- election.2012 %>% select(c(county, FIPS, state, state_po, candidatevotes, 
+                                             totalvotes, pct.2016, pct.2012, votes, total, fips,
+                                             change, fips, party.2016, year, candidate.2012))
+
+## save predictors and class labels
+election.2012.cl = election.2012 %>% select(-c(county, FIPS, state, state_po, candidatevotes, 
+                                             totalvotes, pct.2016, pct.2012, votes, total, fips,
+                                             change, fips, party.2016, year, candidate.2012))
+
+# Only look at counties who voted blue in 2012
+election.dm.cl = election.2012.cl %>% 
+  filter(party == 'democrat') %>% 
+  mutate(candidate = candidate.2016) %>% 
+  select(-c(party, candidate.2016)) %>% 
+  relocate(candidate, .before = Men)
+
+```
+
+Now I'll subset the data into training and test data.
+
+```{r}
+set.seed(15) 
+n <- nrow(election.dm.cl)
+in.trn <- sample.int(n, 0.8*n) 
+trn.cl.dm <- election.dm.cl[ in.trn,]
+tst.cl.dm <- election.dm.cl[-in.trn,]
+
+trn.cl.dm$candidate <- as.factor(as.character(trn.cl.dm$candidate))
+tst.cl.dm$candidate <- as.factor(as.character(tst.cl.dm$candidate))
+```
+
+```{r}
+set.seed(20) 
+nfold <- 10
+folds <- sample(cut(1:nrow(trn.cl.dm), breaks=nfold, labels=FALSE))
+
+records.dm = matrix(NA, nrow=6, ncol=2)
+colnames(records.dm) = c("train.error","test.error")
+rownames(records.dm) = c("tree","logistic","lasso", "knn", "boost", "randomforest")
+```
+
+First I'll fit a decision tree, prune it to minimize misclassification error and record the training and testing error. 
+
+```{r, fig.height = 75, fig.width = 60, fig.align = 'center'}
+# Construct decision tree
+ct.tree.dm <- tree(candidate ~ .-candidate, data = trn.cl.dm, 
+                 control = tree.control(nobs = nrow(trn.cl.dm),
+                                        minsize = 5, mindev = 1e-5))
+
+draw.tree(ct.tree.dm, nodeinfo = TRUE, cex = 2)
+```
+
+
+```{r}
+set.seed(1)
+
+# Perform 10-Fold CV on decision tree
+cv.dm <- cv.tree(ct.tree.dm, FUN = prune.misclass, K = nfold, rand = folds)
+
+# Find the smallest size that has the minimum misclassification error
+best.size.cv <- min(cv.dm$size[cv.dm$dev == min(cv.dm$dev)])
+```
+ 
+```{r}
+# Prune original tree to the optimal size
+ct.tree.pruned <- prune.tree(ct.tree.dm, best = best.size.cv, method = 'misclass')
+
+draw.tree(ct.tree.pruned, nodeinfo = TRUE, cex = 0.5)
+```
+
+```{r}
+# Predict training values
+pred_train_tree <- predict(ct.tree.pruned, trn.cl.dm, type = 'class')
+
+# Predict test values
+pred_test_tree <-  predict(ct.tree.pruned, tst.cl.dm, type = 'class')
+
+# Record train and testing error
+records.dm['tree', 'test.error'] <- calc_error_rate(pred_test_tree, tst.cl.dm$candidate)
+records.dm['tree', 'train.error'] <- calc_error_rate(pred_train_tree, trn.cl.dm$candidate)
+```
+
+Now I'll fit a logistic model, using 0.5 as the probability threshold again. 
+
+```{r}
+# Fit the logistic regression to spam.train
+glm.fit <- glm(candidate ~ ., data = trn.cl.dm, family = binomial)
+
+# Predict spam.test probabilities and round to 5 decimals
+pred_prob_test <- round(predict(glm.fit, tst.cl.dm, type = 'response'), digits = 5)
+# Use 0.5 cutoff to find predicted class
+predicted_ct.test <- ifelse(pred_prob_test <= 0.5, "Donald Trump", "Hillary Clinton")
+
+# Predict spam.train probabilities and round to 5 decimals
+pred_prob_train <- round(predict(glm.fit, trn.cl.dm, type = 'response'), digits = 5)
+# Use 0.5 cutoff to find predicted class
+predicted_ct  <- ifelse(pred_prob_train <= 0.5, "Donald Trump", "Hillary Clinton")
+
+# Calculate test and training error
+records.dm['logistic', 'test.error'] <- calc_error_rate(predicted_ct.test, tst.cl.dm$candidate)
+records.dm['logistic', 'train.error'] <- calc_error_rate(predicted_ct, trn.cl.dm$candidate)
+
+summary(glm.fit)
+```
+
+```{r}
+# Fit the lasso regression to training data
+glm.lassofit <- cv.glmnet(data.matrix(trn.cl.dm[, -1]), as.matrix(trn.cl.dm$candidate), family = 'binomial',
+                          type.measure = 'class', alpha = 1,  lambda = c(1, 5, 10, 50) * 1e-4, foldid = folds)
+
+glm.lassofit$cvm
+coef(glm.lassofit, s = 10e-4)
+
+# Predict spam.test probabilities and round to 5 decimals
+pred_prob_lassotest <- round(predict(glm.lassofit, as.matrix(tst.cl.dm[, -1]), s = 10e-4, type = 'response'), digits = 5)
+# Use 0.5 cutoff to find predicted class
+predicted_ct.lassotest <- ifelse(pred_prob_lassotest <= 0.5, "Donald Trump", "Hillary Clinton")
+
+# Predict spam.train probabilities and round to 5 decimals
+pred_prob_train <- round(predict(glm.lassofit, as.matrix(trn.cl.dm[, -1]), s = 10e-4, type = 'response'), digits = 5)
+# Use 0.5 cutoff to find predicted class
+predicted_lasso_ct  <- ifelse(pred_prob_train <= 0.5, "Donald Trump", "Hillary Clinton")
+
+records.dm['lasso', 'test.error'] <- calc_error_rate(predicted_ct.lassotest, tst.cl.dm$candidate)
+records.dm['lasso', 'train.error'] <- calc_error_rate(predicted_lasso_ct, trn.cl.dm$candidate)
+```
+
+Here we find that a lambda of 10e-04 will minimize MSE. I use this lambda to record the testing and training error. Now I'll use 10-fold cross validation to fit a KNN model. 
+
+```{r}
+set.seed(1)
+kvec = c(1, seq(10, 50, length.out=5))
+train.error.mean = c()
+test.error.mean = c()
+
+for (j in kvec){
+  # Perform 10-fold CV on training set for KNN with each k in kvec 
+  tmp = ldply(1:10, do.chunk, folddef = folds, Xdat = trn.cl.dm[-1], 
+      Ydat = trn.cl.dm$candidate, k = j)
+  
+  # Find mean train and testing error
+  train.error.mean <- c(train.error.mean, mean(tmp$train.error))
+  test.error.mean <- c(test.error.mean, mean(tmp$val.error))
+}
+
+# Record # of neighbors and mean train and testing error
+error.folds <- data.frame(neighbors = kvec, train.error.mean, test.error.mean)
+error.folds
+
+# Find the rows with lowest test error
+lowest.test.error <- error.folds %>% 
+  filter(test.error.mean == min(test.error.mean))
+
+# If there's a tie, return the maximum neighbor 
+best.kfold <- max(lowest.test.error$neighbors)
+best.kfold
+
+```
+So, a k value of 30 leads to the the smallest estimated test error.
+
+```{r}
+# Predict spam.test
+pred_trn_knn <- knn(train = trn.cl.dm[-1], test = trn.cl.dm[-1], 
+               cl = trn.cl.dm$candidate, k = 50)
+
+# Predict spam.train
+pred_tst_knn <- knn(train = trn.cl.dm[-1], test = tst.cl.dm[-1], 
+               cl = trn.cl.dm$candidate, k = 50)
+
+# Record the train and testing error of KNN model
+records.dm['knn', 'test.error'] <- calc_error_rate(pred_tst_knn, tst.cl.dm$candidate)
+records.dm['knn', 'train.error'] <- calc_error_rate(pred_trn_knn, trn.cl.dm$candidate)
+```
+
+Next I fit a boosting model, using a shrinkage parameter of 0.01.
+
+```{r}
+set.seed(1)
+# Fit boosting model to training set
+boost.cl <- gbm(ifelse(candidate=="Hillary Clinton",1,0) ~ ., data = trn.cl.dm,
+                     distribution = 'bernoulli', n.trees = 1000,
+                     shrinkage = 0.01)
+
+# Most important predictors
+summary(boost.cl, cBar = 3)
+```
+
+The most important predictors are by far Transit and White. Now I record training and testing error.
+
+```{r}
+# Predict using boosting model
+boost_tst <- predict(boost.cl, newdata = tst.cl.dm, type = 'response')
+boost_tst <- ifelse(boost_tst >= 0.5, 'Hillary Clinton', 'Donald Trump')
+
+# Predict using boosting model
+boost_trn <- predict(boost.cl, newdata = trn.cl.dm, type = 'response')
+boost_trn <- ifelse(boost_trn >= 0.5, 'Hillary Clinton', 'Donald Trump')
+
+records.dm['boost', 'test.error'] <- calc_error_rate(boost_tst, tst.cl.dm$candidate)
+records.dm['boost', 'train.error'] <- calc_error_rate(boost_trn, trn.cl.dm$candidate)
+records.dm
+```
+
+Finally, I'll fit a random forest model.
+
+```{r}
+set.seed(1)
+
+# Fit random forest model to training set
+rf.cl <- randomForest(candidate ~ ., data = trn.cl.dm, importance = TRUE)
+varImpPlot(rf.cl, n.var = 5, main = "Random Forest Variable Importance")
+```
+
+The most important predictors are once again by far Transit and White. I'll record the training and testing error.
+
+(d)
+```{r}
+# Predict using boosting model
+rf_tst <- predict(rf.cl, newdata = tst.cl.dm, type = 'response')
+
+# Predict using boosting model
+rf_trn <- predict(rf.cl, newdata = trn.cl.dm, type = 'response')
+
+records.dm['randomforest', 'test.error'] <- calc_error_rate(rf_tst, tst.cl.dm$candidate)
+records.dm['randomforest', 'train.error'] <- calc_error_rate(rf_trn, trn.cl.dm$candidate)
+```
+
+Finally, I'll plot the ROC curves for all six models.
+
+```{r}
+# Find ROC values for lasso regression
+lasso.pred <- prediction(pred_prob_lassotest, as.character(tst.cl.dm$candidate))
+lasso.perf <- performance(lasso.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for logistic regression
+log.pred <- prediction(pred_prob_test, as.character(tst.cl.dm$candidate))
+log.perf <- performance(log.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for decision tree
+tree.pred <- prediction(c(pred_test_tree), as.character(tst.cl.dm$candidate))
+tree.perf <- performance(tree.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for knn
+knn.pred <- prediction(c(pred_tst_knn), as.character(tst.cl.dm$candidate))
+knn.perf <- performance(knn.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for knn
+boost.pred <- prediction(ifelse(boost_tst == "Hillary Clinton", 1, 0), 
+                         ifelse(tst.cl.dm$candidate=="Hillary Clinton",1,0))
+boost.perf <- performance(boost.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Find ROC values for knn
+rf.pred <- prediction(c(rf_tst), as.character(tst.cl.dm$candidate))
+rf.perf <- performance(rf.pred, measure = 'tpr', x.measure = 'fpr')
+
+# Plot them both on the same plot in different colors.
+plot(log.perf, col = 'red', lwd = 3, main = 'ROC Curve')
+plot(tree.perf, col = 'blue', lwd = 3, add = TRUE)
+plot(lasso.perf, col = 'green', lwd = 3, add = TRUE)
+plot(knn.perf, col = 'yellow', lwd = 3, add = TRUE)
+plot(boost.perf, col = 'purple', lwd = 3, add = TRUE)
+plot(rf.perf, col = 'black', lwd = 3, add = TRUE)
+legend(0.8, 0.75, legend = c("Log", "Tree", "Lasso", "KNN", "Boost", "Random Forest"),
+       col = c("red", 'blue', 'green', 'yellow', 'purple', 'black'), cex = 0.7, lty = 1)
+abline(0,1)
+
+```
+
+```{r}
+(log.auc = performance(log.pred, 'auc')@y.values)
+(tree.auc = performance(tree.pred, 'auc')@y.values)
+(lasso.auc = performance(lasso.pred, 'auc')@y.values)
+(knn.auc = performance(knn.pred, 'auc')@y.values)
+(boost.auc = performance(boost.pred, 'auc')@y.values)
+(rf.auc = performance(rf.pred, 'auc')@y.values)
+
+records.dm
+```
+
+We see that the logistic regression model maximizes the area under the ROC curve, while the random forest model minimizes the misclassification error. 
+
