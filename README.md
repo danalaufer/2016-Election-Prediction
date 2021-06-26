@@ -13,3 +13,5 @@ parties in the 2016 election. I determine that in this case, a logistic regressi
 most appropriate, and conclude that the most significant predictors in whether a
 formerly Democratic county stayed Democratic or flipped was that county’s proportion of
 white population and proportion of individuals working in particular job sectors.
+<p>&nbsp;</p>
+For a more in depth analysis, see the election analysis PDF.
